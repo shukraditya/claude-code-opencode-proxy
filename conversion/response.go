@@ -2,6 +2,7 @@ package conversion
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -68,6 +69,7 @@ func (c *ResponseConverter) ConvertNonStreaming(openaiResp *models.OpenAIRespons
 }
 
 func (c *ResponseConverter) ConvertStreaming(
+	ctx context.Context,
 	openaiBody io.ReadCloser,
 	flushFn func([]byte) error,
 ) error {
@@ -78,7 +80,7 @@ func (c *ResponseConverter) ConvertStreaming(
 	toolAccumulators := map[int]*streamingToolAccum{}
 	textBlockIndex := 0
 	hasTextContent := false
-
+	var finalUsage *models.OpenAIUsage
 	send := func(event string, data any) error {
 		raw, err := json.Marshal(data)
 		if err != nil {
@@ -104,6 +106,10 @@ func (c *ResponseConverter) ConvertStreaming(
 
 	reader := bufio.NewReader(openaiBody)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
@@ -118,13 +124,14 @@ func (c *ResponseConverter) ConvertStreaming(
 		}
 
 		data := strings.TrimPrefix(line, "data: ")
+
 		if data == "[DONE]" {
 			break
 		}
 
 		var chunk models.OpenAIStreamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			log.Printf("failed to unmarshal chunk: %v", err)
+			log.Printf("failed to unmarshal chunk (len=%d): %v", len(data), err)
 			continue
 		}
 
@@ -174,23 +181,7 @@ func (c *ResponseConverter) ConvertStreaming(
 		}
 
 		if chunk.Usage != nil {
-			usage := map[string]any{
-				"input_tokens":  chunk.Usage.PromptTokens,
-				"output_tokens": chunk.Usage.CompletionTokens,
-			}
-			if chunk.Usage.PromptTokensDetails != nil && chunk.Usage.PromptTokensDetails.CachedTokens > 0 {
-				usage["cache_read_input_tokens"] = chunk.Usage.PromptTokensDetails.CachedTokens
-			}
-			stopReason = "end_turn"
-			if err := send("message_delta", map[string]any{
-				"type": "message_delta",
-				"delta": map[string]string{
-					"stop_reason": "end_turn", "stop_sequence": "",
-				},
-				"usage": usage,
-			}); err != nil {
-				return err
-			}
+			finalUsage = chunk.Usage
 		}
 	}
 
@@ -230,6 +221,24 @@ func (c *ResponseConverter) ConvertStreaming(
 
 	if stopReason == "" {
 		stopReason = "end_turn"
+	}
+
+	usage := map[string]any{}
+	if finalUsage != nil {
+		usage["input_tokens"] = finalUsage.PromptTokens
+		usage["output_tokens"] = finalUsage.CompletionTokens
+		if finalUsage.PromptTokensDetails != nil && finalUsage.PromptTokensDetails.CachedTokens > 0 {
+			usage["cache_read_input_tokens"] = finalUsage.PromptTokensDetails.CachedTokens
+		}
+	}
+	if err := send("message_delta", map[string]any{
+		"type": "message_delta",
+		"delta": map[string]string{
+			"stop_reason": mapFinishReason(stopReason), "stop_sequence": "",
+		},
+		"usage": usage,
+	}); err != nil {
+		return err
 	}
 
 	return send("message_stop", map[string]any{"type": "message_stop"})

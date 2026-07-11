@@ -121,7 +121,7 @@ func (h *Handler) handleStreaming(ctx context.Context, w http.ResponseWriter, cl
 		return nil
 	}
 
-	if err := respConv.ConvertStreaming(openaiBody, flushFn); err != nil {
+	if err := respConv.ConvertStreaming(ctx, openaiBody, flushFn); err != nil {
 		log.Printf("stream conversion error: %v", err)
 	}
 }
